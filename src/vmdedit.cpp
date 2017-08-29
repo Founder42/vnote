@@ -36,7 +36,9 @@ VMdEdit::VMdEdit(VFile *p_file, VDocument *p_vdoc, MarkdownConverterType p_type,
     m_cbHighlighter = new VCodeBlockHighlightHelper(m_mdHighlighter, p_vdoc,
                                                     p_type);
 
-    m_imagePreviewer = new VImagePreviewer(this, 500);
+    m_imagePreviewer = new VImagePreviewer(this);
+    connect(m_mdHighlighter, &HGMarkdownHighlighter::imageLinksUpdated,
+            m_imagePreviewer, &VImagePreviewer::imageLinksChanged);
 
     m_editOps = new VMdEditOperations(this, m_file);
 
@@ -396,6 +398,7 @@ void VMdEdit::handleSelectionChanged()
         return;
     }
 
+    /*
     QString text = textCursor().selectedText();
     if (text.isEmpty() && !m_imagePreviewer->isPreviewEnabled()) {
         m_imagePreviewer->enableImagePreview();
@@ -405,9 +408,10 @@ void VMdEdit::handleSelectionChanged()
             // We can let the user copy the image.
             return;
         } else if (text.contains(QChar::ObjectReplacementCharacter)) {
-            m_imagePreviewer->disableImagePreview();
+            // m_imagePreviewer->disableImagePreview();
         }
     }
+    */
 }
 
 void VMdEdit::handleClipboardChanged(QClipboard::Mode p_mode)

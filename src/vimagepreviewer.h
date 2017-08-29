@@ -5,9 +5,9 @@
 #include <QString>
 #include <QTextBlock>
 #include <QHash>
+#include "hgmarkdownhighlighter.h"
 
 class VMdEdit;
-class QTimer;
 class QTextDocument;
 class VFile;
 class VDownloader;
@@ -16,25 +16,28 @@ class VImagePreviewer : public QObject
 {
     Q_OBJECT
 public:
-    explicit VImagePreviewer(VMdEdit *p_edit, int p_timeToPreview);
+    explicit VImagePreviewer(VMdEdit *p_edit);
 
-    void disableImagePreview();
-    void enableImagePreview();
-    bool isPreviewEnabled();
-
+    // Whether @p_block is an image previewed block.
+    // The image previewed block is a block containing only the special character
+    // and whitespaces.
     bool isImagePreviewBlock(const QTextBlock &p_block);
 
     QImage fetchCachedImageFromPreviewBlock(QTextBlock &p_block);
 
     // Clear the m_imageCache and all the preview blocks.
-    // Then re-preview all the blocks.
+    // Then re-preview all images.
     void refresh();
 
+    // Re-preview all images.
     void update();
 
+public slots:
+    // Image links have changed.
+    void imageLinksChanged(const QVector<VElementRegion> &p_imageRegions);
+
 private slots:
-    void timerTimeout();
-    void handleContentChange(int p_position, int p_charsRemoved, int p_charsAdded);
+    // Non-local image downloaded for preview.
     void imageDownloaded(const QByteArray &p_data, const QString &p_url);
 
 private:
@@ -49,7 +52,65 @@ private:
         int m_width;
     };
 
+    struct ImageLinkInfo
+    {
+        ImageLinkInfo()
+            : m_startPos(-1), m_endPos(-1),
+              m_isBlock(false), m_previewImageID(-1)
+        {
+        }
+
+        ImageLinkInfo(int p_startPos, int p_endPos)
+            : m_startPos(p_startPos), m_endPos(p_endPos),
+              m_isBlock(false), m_previewImageID(-1)
+        {
+        }
+
+        int m_startPos;
+        int m_endPos;
+        QString m_linkUrl;
+
+        // Whether it is a image block.
+        bool m_isBlock;
+
+        // The previewed image ID if this link has been previewed.
+        // -1 if this link has not yet been previewed.
+        long long m_previewImageID;
+    };
+
+    // Info about a previewed image.
+    struct PreviewImageInfo
+    {
+        PreviewImageInfo() : m_id(-1), m_timeStamp(-1)
+        {
+        }
+
+        PreviewImageInfo(long long p_id, long long p_timeStamp, const QString p_path)
+            : m_id(p_id), m_timeStamp(p_timeStamp), m_path(p_path)
+        {
+        }
+
+        long long m_id;
+        long long m_timeStamp;
+        QString m_path;
+    };
+
+    // Kick off new preview of m_imageRegions.
+    void kickOffPreview(const QVector<VElementRegion> &p_imageRegions);
+
+    // Preview images according to m_timeStamp and m_imageRegions.
     void previewImages();
+
+    // According to m_imageRegions, fetch the image link Url.
+    // Will check if this link has been previewed correctly and mark the previewed
+    // image with the newest timestamp.
+    // @p_imageLinks should be sorted in descending order of m_startPos.
+    void fetchImageLinksFromRegions(QVector<ImageLinkInfo> &p_imageLinks);
+
+    // Check if there is a correct previewed image following the @p_info link.
+    // Returns the previewImageID if yes. Otherwise, returns -1.
+    long long isImageLinkPreviewed(const ImageLinkInfo &p_info);
+
     bool isValidImagePreviewBlock(QTextBlock &p_block);
 
     // Fetch the image link's URL if there is only one link.
@@ -75,9 +136,18 @@ private:
     // Remove the ObjectReplacementCharacter chars.
     void clearCorruptedImagePreviewBlock(QTextBlock &p_block);
 
-    void clearAllImagePreviewBlocks();
+    // Clear all the previewed images.
+    void clearAllPreviewedImages();
 
-    QTextImageFormat fetchFormatFromPreviewBlock(QTextBlock &p_block);
+    // Fetch the text image format from an image preview block.
+    QTextImageFormat fetchFormatFromPreviewBlock(const QTextBlock &p_block) const;
+
+    // Fetch the text image format from an image preview position.
+    QTextImageFormat fetchFormatFromPosition(int p_position) const;
+
+    // Fetch the ImageID from an image format.
+    // Returns -1 if not valid.
+    long long fetchPreviewImageIDFromFormat(const QTextImageFormat &p_format) const;
 
     QString fetchImagePathFromPreviewBlock(QTextBlock &p_block);
 
@@ -99,12 +169,6 @@ private:
     VMdEdit *m_edit;
     QTextDocument *m_document;
     VFile *m_file;
-    QTimer *m_timer;
-    bool m_enablePreview;
-    bool m_isPreviewing;
-    bool m_requestCearBlocks;
-    bool m_requestRefreshBlocks;
-    bool m_updatePending;
 
     // Map from image full path to QUrl identifier in the QTextDocument's cache.
     QHash<QString, ImageInfo> m_imageCache;;
@@ -113,6 +177,19 @@ private:
 
     // The preview width.
     int m_imageWidth;
+
+    // Used to denote the obsolete previewed images.
+    // Increased when a new preview is kicked off.
+    long long m_timeStamp;
+
+    // Incremental ID for previewed images.
+    long long m_previewIndex;
+
+    // Map from previewImageID to PreviewImageInfo.
+    QHash<long long, PreviewImageInfo> m_previewImages;
+
+    // Regions of all the image links.
+    QVector<VElementRegion> m_imageRegions;
 
     static const int c_minImageWidth;
 };

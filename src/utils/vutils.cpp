@@ -684,3 +684,13 @@ bool VUtils::splitPathInBasePath(const QString &p_base,
     qDebug() << QString("split path %1 based on %2 to %3 parts").arg(p_path).arg(p_base).arg(p_parts.size());
     return true;
 }
+
+void VUtils::decodeUrl(QString &p_url)
+{
+    QHash<QString, QString> maps;
+    maps.insert("%20", " ");
+
+    for (auto it = maps.begin(); it != maps.end(); ++it) {
+        p_url.replace(it.key(), it.value());
+    }
+}

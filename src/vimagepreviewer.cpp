@@ -15,63 +15,58 @@
 
 extern VConfigManager *g_config;
 
-enum ImageProperty { ImagePath = 1 };
+enum ImageProperty { ImageID = 1, /* ID of the image to preview (long long). */
+                     ImagePath };
 
 const int VImagePreviewer::c_minImageWidth = 100;
 
-VImagePreviewer::VImagePreviewer(VMdEdit *p_edit, int p_timeToPreview)
+VImagePreviewer::VImagePreviewer(VMdEdit *p_edit)
     : QObject(p_edit), m_edit(p_edit), m_document(p_edit->document()),
-      m_file(p_edit->getFile()), m_enablePreview(true), m_isPreviewing(false),
-      m_requestCearBlocks(false), m_requestRefreshBlocks(false),
-      m_updatePending(false), m_imageWidth(c_minImageWidth)
+      m_file(p_edit->getFile()), m_imageWidth(c_minImageWidth),
+      m_timeStamp(0), m_previewIndex(0)
 {
-    m_timer = new QTimer(this);
-    m_timer->setSingleShot(true);
-    Q_ASSERT(p_timeToPreview > 0);
-    m_timer->setInterval(p_timeToPreview);
-
-    connect(m_timer, &QTimer::timeout,
-            this, &VImagePreviewer::timerTimeout);
-
     m_downloader = new VDownloader(this);
     connect(m_downloader, &VDownloader::downloadFinished,
             this, &VImagePreviewer::imageDownloaded);
-
-    connect(m_edit->document(), &QTextDocument::contentsChange,
-            this, &VImagePreviewer::handleContentChange);
 }
 
-void VImagePreviewer::timerTimeout()
+static bool equalImageRegions(const QVector<VElementRegion> &p_imageA,
+                              const QVector<VElementRegion> &p_imageB)
+{
+    if (p_imageA.size() != p_imageB.size()) {
+        return false;
+    }
+
+    for (int i = 0; i < p_imageA.size(); ++i) {
+        if (!(p_imageA[i] == p_imageB[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void VImagePreviewer::imageLinksChanged(const QVector<VElementRegion> &p_imageRegions)
+{
+    if (equalImageRegions(p_imageRegions, m_imageRegions)) {
+        qDebug() << "image preview deduplicated";
+        return;
+    }
+
+    kickOffPreview(p_imageRegions);
+}
+
+void VImagePreviewer::kickOffPreview(const QVector<VElementRegion> &p_imageRegions)
 {
     if (!g_config->getEnablePreviewImages()) {
-        if (m_enablePreview) {
-            disableImagePreview();
-        }
+        clearAllPreviewedImages();
         return;
     }
 
-    if (!m_enablePreview) {
-        return;
-    }
-
-    if (m_isPreviewing) {
-        m_updatePending = true;
-        return;
-    }
+    m_imageRegions = p_imageRegions;
+    ++m_timeStamp;
 
     previewImages();
-}
-
-void VImagePreviewer::handleContentChange(int /* p_position */,
-                                          int p_charsRemoved,
-                                          int p_charsAdded)
-{
-    if (p_charsRemoved == 0 && p_charsAdded == 0) {
-        return;
-    }
-
-    m_timer->stop();
-    m_timer->start();
 }
 
 bool VImagePreviewer::isNormalBlock(const QTextBlock &p_block)
@@ -81,55 +76,88 @@ bool VImagePreviewer::isNormalBlock(const QTextBlock &p_block)
 
 void VImagePreviewer::previewImages()
 {
-    if (m_isPreviewing) {
-        return;
-    }
-
     // Get the width of the m_edit.
     m_imageWidth = qMax(m_edit->size().width() - 50, c_minImageWidth);
 
-    m_isPreviewing = true;
-    QTextBlock block = m_document->begin();
-    while (block.isValid() && m_enablePreview) {
-        if (isImagePreviewBlock(block)) {
-            // Image preview block. Check if it is parentless.
-            if (!isValidImagePreviewBlock(block) || !isNormalBlock(block)) {
-                QTextBlock nblock = block.next();
-                removeBlock(block);
-                block = nblock;
-            } else {
-                block = block.next();
-            }
-        } else {
-            clearCorruptedImagePreviewBlock(block);
+    QVector<ImageLinkInfo> imageLinks;
+    fetchImageLinksFromRegions(imageLinks);
+}
 
-            if (isNormalBlock(block)) {
-                block = previewImageOfOneBlock(block);
+void VImagePreviewer::fetchImageLinksFromRegions(QVector<ImageLinkInfo> &p_imageLinks)
+{
+    p_imageLinks.clear();
+
+    if (m_imageRegions.isEmpty()) {
+        return;
+    }
+
+    p_imageLinks.reserve(m_imageRegions.size());
+
+    for (int i = 0; i < m_imageRegions.size(); ++i) {
+        VElementRegion &reg = m_imageRegions[i];
+        QTextBlock block = m_document->findBlock(reg.m_startPos);
+        if (!block.isValid()) {
+            continue;
+        }
+
+        int blockStart = block.position();
+        int blockEnd = blockStart + block.length() - 1;
+        Q_ASSERT(reg.m_endPos <= blockEnd);
+        ImageLinkInfo info(reg.m_startPos, reg.m_endPos);
+        if (reg.m_startPos == blockStart && reg.m_endPos == blockEnd) {
+            // Image block.
+            info.m_isBlock = true;
+            info.m_linkUrl = fetchImagePathToPreview(block.text());
+        } else {
+            // Inline image.
+            QString text = block.text();
+
+            info.m_isBlock = false;
+            info.m_linkUrl = fetchImagePathToPreview(text.mid(reg.m_startPos - blockStart,
+                                                              reg.m_endPos - reg.m_startPos));
+        }
+
+        // Check if this image link has been previewed previously.
+        info.m_previewImageID = isImageLinkPreviewed(info);
+
+        // Sorted in descending order of m_startPos.
+        p_imageLinks.append(info);
+
+        qDebug() << "image region" << i << info.m_startPos << info.m_endPos
+                 << info.m_linkUrl << info.m_isBlock << info.m_previewImageID;
+    }
+}
+
+long long VImagePreviewer::isImageLinkPreviewed(const ImageLinkInfo &p_info)
+{
+    long long imageID = -1;
+    if (p_info.m_isBlock) {
+        QTextBlock block = m_document->findBlock(p_info.m_startPos);
+        QTextBlock nextBlock = block.next();
+        if (!nextBlock.isValid() || !isImagePreviewBlock(nextBlock)) {
+            return imageID;
+        }
+
+        QTextImageFormat format = fetchFormatFromPreviewBlock(nextBlock);
+        imageID = fetchPreviewImageIDFromFormat(format);
+    } else {
+        QTextImageFormat format = fetchFormatFromPosition(p_info.m_endPos);
+        imageID = fetchPreviewImageIDFromFormat(format);
+    }
+
+    if (imageID != -1) {
+        auto it = m_previewImages.find(imageID);
+        if (it != m_previewImages.end()) {
+            PreviewImageInfo &img = it.value();
+            if (img.m_path == p_info.m_linkUrl) {
+                img.m_timeStamp = m_timeStamp;
             } else {
-                block = block.next();
+                imageID = -1;
             }
         }
     }
 
-    m_isPreviewing = false;
-
-    if (m_requestCearBlocks) {
-        m_requestCearBlocks = false;
-        clearAllImagePreviewBlocks();
-    }
-
-    if (m_requestRefreshBlocks) {
-        m_requestRefreshBlocks = false;
-        refresh();
-    }
-
-    if (m_updatePending) {
-        m_updatePending = false;
-        m_timer->stop();
-        m_timer->start();
-    }
-
-    emit m_edit->statusChanged();
+    return imageID;
 }
 
 bool VImagePreviewer::isImagePreviewBlock(const QTextBlock &p_block)
@@ -193,6 +221,7 @@ QString VImagePreviewer::fetchImagePathToPreview(const QString &p_text)
 
     QString imagePath;
     QFileInfo info(m_file->retriveBasePath(), imageUrl);
+
     if (info.exists()) {
         if (info.isNativePath()) {
             // Local file.
@@ -201,8 +230,20 @@ QString VImagePreviewer::fetchImagePathToPreview(const QString &p_text)
             imagePath = imageUrl;
         }
     } else {
-        QUrl url(imageUrl);
-        imagePath = url.toString();
+        QString decodedUrl(imageUrl);
+        VUtils::decodeUrl(decodedUrl);
+        QFileInfo dinfo(m_file->retriveBasePath(), decodedUrl);
+        if (dinfo.exists()) {
+            if (dinfo.isNativePath()) {
+                // Local file.
+                imagePath = QDir::cleanPath(dinfo.absoluteFilePath());
+            } else {
+                imagePath = imageUrl;
+            }
+        } else {
+            QUrl url(imageUrl);
+            imagePath = url.toString();
+        }
     }
 
     return imagePath;
@@ -346,41 +387,13 @@ void VImagePreviewer::clearCorruptedImagePreviewBlock(QTextBlock &p_block)
     }
 }
 
-bool VImagePreviewer::isPreviewEnabled()
+void VImagePreviewer::clearAllPreviewedImages()
 {
-    return m_enablePreview;
-}
-
-void VImagePreviewer::enableImagePreview()
-{
-    m_enablePreview = true;
-
-    if (g_config->getEnablePreviewImages()) {
-        m_timer->stop();
-        m_timer->start();
-    }
-}
-
-void VImagePreviewer::disableImagePreview()
-{
-    m_enablePreview = false;
-
-    if (m_isPreviewing) {
-        // It is previewing, append the request and clear preview blocks after
-        // finished previewing.
-        // It is weird that when selection changed, it will interrupt the process
-        // of previewing.
-        m_requestCearBlocks = true;
+    if (m_imageRegions.isEmpty()) {
         return;
     }
 
-    clearAllImagePreviewBlocks();
-}
-
-void VImagePreviewer::clearAllImagePreviewBlocks()
-{
-    V_ASSERT(!m_isPreviewing);
-
+    /*
     QTextBlock block = m_document->begin();
     QTextCursor cursor = m_edit->textCursor();
     bool modified = m_edit->isModified();
@@ -402,6 +415,9 @@ void VImagePreviewer::clearAllImagePreviewBlocks()
     m_edit->setModified(modified);
 
     emit m_edit->statusChanged();
+    */
+
+    m_imageRegions.clear();
 }
 
 QString VImagePreviewer::fetchImagePathFromPreviewBlock(QTextBlock &p_block)
@@ -414,7 +430,7 @@ QString VImagePreviewer::fetchImagePathFromPreviewBlock(QTextBlock &p_block)
     return format.property(ImagePath).toString();
 }
 
-QTextImageFormat VImagePreviewer::fetchFormatFromPreviewBlock(QTextBlock &p_block)
+QTextImageFormat VImagePreviewer::fetchFormatFromPreviewBlock(const QTextBlock &p_block) const
 {
     QTextCursor cursor(p_block);
     int shift = p_block.text().indexOf(QChar::ObjectReplacementCharacter);
@@ -425,6 +441,38 @@ QTextImageFormat VImagePreviewer::fetchFormatFromPreviewBlock(QTextBlock &p_bloc
     }
 
     return cursor.charFormat().toImageFormat();
+}
+
+QTextImageFormat VImagePreviewer::fetchFormatFromPosition(int p_position) const
+{
+    if (m_document->characterAt(p_position) != QChar::ObjectReplacementCharacter) {
+        return QTextImageFormat();
+    }
+
+    QTextCursor cursor(m_document);
+    cursor.setPosition(p_position);
+    if (cursor.atBlockEnd()) {
+        return QTextImageFormat();
+    }
+
+    cursor.movePosition(QTextCursor::Right, QTextCursor::MoveAnchor, 1);
+
+    return cursor.charFormat().toImageFormat();
+}
+
+long long VImagePreviewer::fetchPreviewImageIDFromFormat(const QTextImageFormat &p_format) const
+{
+    if (!p_format.isValid()) {
+        return -1;
+    }
+
+    bool ok = true;
+    long long id = p_format.property(ImageID).toLongLong(&ok);
+    if (ok) {
+        return id;
+    } else {
+        return -1;
+    }
 }
 
 void VImagePreviewer::updateFormatInPreviewBlock(QTextBlock &p_block,
@@ -496,28 +544,17 @@ void VImagePreviewer::imageDownloaded(const QByteArray &p_data, const QString &p
             return;
         }
 
-        m_timer->stop();
         QString name(imagePathToCacheResourceName(p_url));
         m_document->addResource(QTextDocument::ImageResource, name, image);
         m_imageCache.insert(p_url, ImageInfo(name, image.width()));
 
         qDebug() << "downloaded image cache insert" << p_url << name;
-
-        m_timer->start();
     }
 }
 
 void VImagePreviewer::refresh()
 {
-    if (m_isPreviewing) {
-        m_requestRefreshBlocks = true;
-        return;
-    }
 
-    m_timer->stop();
-    m_imageCache.clear();
-    clearAllImagePreviewBlocks();
-    m_timer->start();
 }
 
 QImage VImagePreviewer::fetchCachedImageFromPreviewBlock(QTextBlock &p_block)
@@ -557,6 +594,4 @@ bool VImagePreviewer::updateImageWidth(QTextImageFormat &p_format)
 
 void VImagePreviewer::update()
 {
-    m_timer->stop();
-    m_timer->start();
 }
